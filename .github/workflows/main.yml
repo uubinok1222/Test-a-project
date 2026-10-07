@@ -1,0 +1,254 @@
+name: analyze-ipa
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: 'Direct download URL to IPA'
+        required: true
+      sha256_expected:
+        description: 'Optional: expected SHA256 of the IPA'
+        required: false
+        default: ''
+
+jobs:
+  analyze:
+    runs-on: macos-13
+    timeout-minutes: 30
+    steps:
+      - name: Download IPA
+        run: |
+          set -e
+          echo "downloading..."
+          curl -L --fail --retry 3 -o roblox.ipa "${{ github.event.inputs.ipa_url }}"
+          ls -lh roblox.ipa
+
+      - name: Verify SHA256 (optional)
+        if: ${{ github.event.inputs.sha256_expected != '' }}
+        run: |
+          ACTUAL=$(shasum -a 256 roblox.ipa | awk '{print $1}')
+          EXPECTED="${{ github.event.inputs.sha256_expected }}"
+          echo "actual:   $ACTUAL"
+          echo "expected: $EXPECTED"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::SHA256 mismatch"
+            exit 1
+          fi
+
+      - name: Unzip
+        run: |
+          unzip -q roblox.ipa -d extracted
+          echo "=== top level ==="
+          ls -la extracted/
+          echo "=== Payload ==="
+          ls -la extracted/Payload/
+
+      - name: File sizes (key files)
+        run: |
+          APP="extracted/Payload/Roblox.app"
+          echo "=== main binary ==="
+          ls -lh "$APP/Roblox" || true
+          echo "=== Assets.car ==="
+          ls -lh "$APP/Assets.car" || true
+          echo "=== Frameworks ==="
+          du -sh "$APP/Frameworks"/* 2>/dev/null || true
+          echo "=== total app size ==="
+          du -sh "$APP"
+
+      - name: Architecture + cryptid
+        run: |
+          APP="extracted/Payload/Roblox.app"
+          echo "=== lipo -info main binary ==="
+          lipo -info "$APP/Roblox" || true
+          echo ""
+          echo "=== LC_ENCRYPTION_INFO (main binary) ==="
+          otool -l "$APP/Roblox" | grep -A6 LC_ENCRYPTION_INFO || echo "no LC_ENCRYPTION_INFO found"
+          echo ""
+          echo "=== cryptid value (cryptid 0 = decrypted) ==="
+          otool -l "$APP/Roblox" | grep -A6 LC_ENCRYPTION_INFO | grep cryptid || true
+
+      - name: Linked dylibs (main binary)
+        run: |
+          APP="extracted/Payload/Roblox.app"
+          otool -L "$APP/Roblox" | head -60
+
+      - name: Suspicious files check
+        run: |
+          APP="extracted/Payload/Roblox.app"
+          echo "=== ARCHITECTURE.md ==="
+          cat "$APP/ARCHITECTURE.md" 2>/dev/null || echo "not found"
+          echo ""
+          echo "=== Decrypted file ==="
+          file "$APP/Decrypted" 2>/dev/null || echo "not found"
+          ls -lh "$APP/Decrypted" 2>/dev/null || echo "not found"
+          echo ""
+          echo "=== InfoScreenController.h (first 50 lines) ==="
+          head -50 "$APP/InfoScreenController.h" 2>/dev/null || echo "not found"
+
+      - name: Info.plist key fields
+        run: |
+          APP="extracted/Payload/Roblox.app"
+          plutil -p "$APP/Info.plist" | grep -E "CFBundleIdentifier|CFBundleShortVersionString|CFBundleVersion|MinimumOSVersion|CFBundleExecutable|CFBundleURLSchemes" || true
+
+      - name: Entitlements
+        run: |
+          APP="extracted/Payload/Roblox.app"
+          codesign -d --entitlements - "$APP" 2>&1 | head -60 || true
+
+      - name: Code signature info
+        run: |
+          APP="extracted/Payload/Roblox.app"
+          codesign -dv --verbose=4 "$APP" 2>&1 | head -30 || true
+
+      - name: Strings scan for suspicious patterns
+        run: |
+          APP="extracted/Payload/Roblox.app"
+          echo "=== URLs (unique, non-apple, non-roblox) ==="
+          strings "$APP/Roblox" | grep -E "https?://" | sort -u | head -80
+          echo ""
+          echo "=== suspicious keywords ==="
+          strings "$APP/Roblox" | grep -iE "cydia|sileo|substrate|substitute|ellekit|frida|inject|hook|jailbreak|bypass|patch" | head -40 || echo "none matched"
+
+      - name: Compare with known Roblox frameworks
+        run: |
+          APP="extracted/Payload/Roblox.app"
+          echo "=== frameworks present ==="
+          ls "$APP/Frameworks/"
+          echo ""
+          echo "=== expected for Roblox iOS: Backtrace, Backtrace_PLCrashReporter, Persona2, Reaper, RobloxLib ==="
+          echo "=== anything extra is suspicious ==="
+
+      - name: Upload full log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: analysis-log
+          path: |
+            extracted/Payload/Roblox.app/Info.plist
+            extracted/Payload/Roblox.app/ARCHITECTURE.md
+            extracted/Payload/Roblox.app/InfoScreenController.h
+          if-no-files-found: ignore
+ipa_url:
+        description: 'Direct download URL to IPA'
+        required: true
+        sha256_expected:
+        description: 'Optional: expected SHA256 of the IPA'
+        required: false
+        default: ''
+
+jobs:
+  analyze:
+    runs-on: macos-13
+    timeout-minutes: 30
+    steps:
+      - name: Download IPA
+        run: |
+          set -e
+          echo "downloading..."
+          curl -L --fail --retry 3 -o roblox.ipa "${{ github.event.inputs.ipa_url }}"
+          ls -lh roblox.ipa
+
+      - name: Verify SHA256 (optional)
+        if: ${{ github.event.inputs.sha256_expected != '' }}
+        run: |
+          ACTUAL=$(shasum -a 256 roblox.ipa | awk '{print $1}')
+          EXPECTED="${{ github.event.inputs.sha256_expected }}"
+          echo "actual:   $ACTUAL"
+          echo "expected: $EXPECTED"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::SHA256 mismatch"
+            exit 1
+          fi
+
+      - name: Unzip
+        run: |
+          unzip -q roblox.ipa -d extracted
+          echo "=== top level ==="
+          ls -la extracted/
+          echo "=== Payload ==="
+          ls -la extracted/Payload/
+
+      - name: File sizes (key files)
+        run: |
+          APP="extracted/Payload/Roblox.app"
+          echo "=== main binary ==="
+          ls -lh "$APP/Roblox" || true
+          echo "=== Assets.car ==="
+          ls -lh "$APP/Assets.car" || true
+          echo "=== Frameworks ==="
+          du -sh "$APP/Frameworks"/* 2>/dev/null || true
+          echo "=== total app size ==="
+          du -sh "$APP"
+
+      - name: Architecture + cryptid
+        run: |
+          APP="extracted/Payload/Roblox.app"
+          echo "=== lipo -info main binary ==="
+          lipo -info "$APP/Roblox" || true
+          echo ""
+          echo "=== LC_ENCRYPTION_INFO (main binary) ==="
+          otool -l "$APP/Roblox" | grep -A6 LC_ENCRYPTION_INFO || echo "no LC_ENCRYPTION_INFO found"
+          echo ""
+          echo "=== cryptid value (cryptid 0 = decrypted) ==="
+          otool -l "$APP/Roblox" | grep -A6 LC_ENCRYPTION_INFO | grep cryptid || true
+
+      - name: Linked dylibs (main binary)
+        run: |
+          APP="extracted/Payload/Roblox.app"
+          otool -L "$APP/Roblox" | head -60
+
+      - name: Suspicious files check
+        run: |
+          APP="extracted/Payload/Roblox.app"
+          echo "=== ARCHITECTURE.md ==="
+          cat "$APP/ARCHITECTURE.md" 2>/dev/null || echo "not found"
+          echo ""
+          echo "=== Decrypted file ==="
+          file "$APP/Decrypted" 2>/dev/null || echo "not found"
+          ls -lh "$APP/Decrypted" 2>/dev/null || echo "not found"
+          echo ""
+          echo "=== InfoScreenController.h (first 50 lines) ==="
+          head -50 "$APP/InfoScreenController.h" 2>/dev/null || echo "not found"
+
+      - name: Info.plist key fields
+        run: |
+          APP="extracted/Payload/Roblox.app"
+          plutil -p "$APP/Info.plist" | grep -E "CFBundleIdentifier|CFBundleShortVersionString|CFBundleVersion|MinimumOSVersion|CFBundleExecutable|CFBundleURLSchemes" || true
+
+      - name: Entitlements
+        run: |
+          APP="extracted/Payload/Roblox.app"
+          codesign -d --entitlements - "$APP" 2>&1 | head -60 || true
+
+      - name: Code signature info
+        run: |
+          APP="extracted/Payload/Roblox.app"
+          codesign -dv --verbose=4 "$APP" 2>&1 | head -30 || true
+
+      - name: Strings scan for suspicious patterns
+        run: |
+          APP="extracted/Payload/Roblox.app"
+          echo "=== URLs (unique, non-apple, non-roblox) ==="
+          strings "$APP/Roblox" | grep -E "https?://" | sort -u | head -80
+          echo ""
+          echo "=== suspicious keywords ==="
+          strings "$APP/Roblox" | grep -iE "cydia|sileo|substrate|substitute|ellekit|frida|inject|hook|jailbreak|bypass|patch" | head -40 || echo "none matched"
+
+      - name: Compare with known Roblox frameworks
+        run: |
+          APP="extracted/Payload/Roblox.app"
+          echo "=== frameworks present ==="
+          ls "$APP/Frameworks/"
+          echo ""
+          echo "=== expected for Roblox iOS: Backtrace, Backtrace_PLCrashReporter, Persona2, Reaper, RobloxLib ==="
+          echo "=== anything extra is suspicious ==="
+
+      - name: Upload full log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: analysis-log
+          path: |
+            extracted/Payload/Roblox.app/Info.plist
+            extracted/Payload/Roblox.app/ARCHITECTURE.md
+            extracted/Payload/Roblox.app/InfoScreenController.h
+          if-no-files-found: ignore
