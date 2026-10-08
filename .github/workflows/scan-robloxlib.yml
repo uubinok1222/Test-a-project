@@ -37,18 +37,69 @@ jobs:
           for i, b in enumerate(fat):
               print(f"\n--- slice {i} ---")
               print(f"cpu: {b.header.cpu_type}")
-              print(f"file type: {b.header.file_type}")
               print(f"n libraries: {len(b.libraries)}")
               print(f"segments:")
               for seg in b.segments:
                   print(f"  {seg.name} size={seg.virtual_size:#x}")
               print(f"symbols: {len(b.symbols)}")
-              if len(b.symbols) > 0:
-                  print("first 30 symbols:")
-                  for s in b.symbols[:30]:
-                      print(f"  {s.name}")
+
+              print("\nfirst 50 symbols:")
+              count = 0
+              for sym in b.symbols:
+                  print(f"  {sym.name}")
+                  count += 1
+                  if count >= 50:
+                      break
+
+              print("\nsymbols containing 'lua':")
+              count = 0
+              for sym in b.symbols:
+                  if "lua" in sym.name.lower():
+                      print(f"  {sym.name}")
+                      count += 1
+                      if count >= 100:
+                          break
+              if count == 0:
+                  print("  (none)")
+
+              print("\nsymbols containing keywords:")
+              keywords = ["pcall", "loadstring", "loadbuffer", "getglobal", "setglobal",
+                          "getfield", "setfield", "pushcfunction", "newstate"]
+              for kw in keywords:
+                  matches = []
+                  for sym in b.symbols:
+                      if kw.lower() in sym.name.lower():
+                          matches.append(sym.name)
+                          if len(matches) >= 10:
+                              break
+                  if matches:
+                      print(f"  [{kw}]")
+                      for m in matches:
+                          print(f"    {m}")
           PYEOF
           python3 /tmp/macho.py
+
+      - name: Dump all symbols
+        run: |
+          cat > /tmp/dump_syms.py << 'PYEOF'
+          import lief
+          fat = lief.MachO.parse("RobloxLib")
+          with open("symbols_all.txt", "w") as f:
+              for b in fat:
+                  for sym in b.symbols:
+                      f.write(sym.name + "\n")
+          print("dumped")
+          PYEOF
+          python3 /tmp/dump_syms.py
+          wc -l symbols_all.txt || true
+          echo "=== symbols with lua/luau ==="
+          grep -iE "lua|luau" symbols_all.txt | head -100 || echo "none"
+          echo ""
+          echo "=== symbols with pcall/load/state ==="
+          grep -iE "pcall|loadstring|loadbuffer|getglobal|setglobal|getfield|setfield|pushcfunction|newstate|lua_state" symbols_all.txt | head -100 || echo "none"
+          echo ""
+          echo "=== symbols with Luau namespace (C++ mangled) ==="
+          grep -E "_ZN4Luau|Luau" symbols_all.txt | head -50 || echo "none"
 
       - name: Luau string scan
         run: |
@@ -63,10 +114,10 @@ jobs:
             echo "  \"$s\": $count"
           done
 
-      - name: Lua symbols
+      - name: Lua symbols via strings
         run: |
           F="RobloxLib"
-          echo "=== lua_ symbols ==="
+          echo "=== lua_ symbols via strings ==="
           strings -a "$F" | grep -E "^lua_|^luaL_|^luaD_|^luaV_" | sort -u | head -100 || echo "none"
           echo ""
           echo "=== luau/getgenv keywords ==="
@@ -77,7 +128,7 @@ jobs:
           strings -a RobloxLib > robloxlib_strings.txt
           wc -l robloxlib_strings.txt
           grep -iE "lua|luau" robloxlib_strings.txt > lua_strings.txt || true
-          wc -l lua_strings.txt
+          wc -l lua_strings.txt || true
           head -100 lua_strings.txt
 
       - name: Upload artifact
@@ -87,4 +138,5 @@ jobs:
           path: |
             robloxlib_strings.txt
             lua_strings.txt
+            symbols_all.txt
           retention-days: 7
