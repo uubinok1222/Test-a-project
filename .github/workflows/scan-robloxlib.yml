@@ -1,10 +1,10 @@
-name: scan-robloxlib
+name: luau-recon
 
 on:
   workflow_dispatch:
 
 jobs:
-  scan:
+  recon:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -23,63 +23,7 @@ jobs:
           file RobloxLib
           sha256sum RobloxLib
 
-      - name: Mach-O analysis
-        run: |
-          cat > /tmp/macho.py << 'PYEOF'
-          import lief
-          import sys
-          path = "RobloxLib"
-          fat = lief.MachO.parse(path)
-          if fat is None:
-              print("ERROR: cannot parse")
-              sys.exit(1)
-          print(f"slices: {len(fat)}")
-          for i, b in enumerate(fat):
-              print(f"\n--- slice {i} ---")
-              print(f"cpu: {b.header.cpu_type}")
-              print(f"n libraries: {len(b.libraries)}")
-              print(f"segments:")
-              for seg in b.segments:
-                  print(f"  {seg.name} size={seg.virtual_size:#x}")
-              print(f"symbols: {len(b.symbols)}")
-
-              print("\nfirst 50 symbols:")
-              count = 0
-              for sym in b.symbols:
-                  print(f"  {sym.name}")
-                  count += 1
-                  if count >= 50:
-                      break
-
-              print("\nsymbols containing 'lua':")
-              count = 0
-              for sym in b.symbols:
-                  if "lua" in sym.name.lower():
-                      print(f"  {sym.name}")
-                      count += 1
-                      if count >= 100:
-                          break
-              if count == 0:
-                  print("  (none)")
-
-              print("\nsymbols containing keywords:")
-              keywords = ["pcall", "loadstring", "loadbuffer", "getglobal", "setglobal",
-                          "getfield", "setfield", "pushcfunction", "newstate"]
-              for kw in keywords:
-                  matches = []
-                  for sym in b.symbols:
-                      if kw.lower() in sym.name.lower():
-                          matches.append(sym.name)
-                          if len(matches) >= 10:
-                              break
-                  if matches:
-                      print(f"  [{kw}]")
-                      for m in matches:
-                          print(f"    {m}")
-          PYEOF
-          python3 /tmp/macho.py
-
-      - name: Dump all symbols
+      - name: Dump symbols
         run: |
           cat > /tmp/dump_syms.py << 'PYEOF'
           import lief
@@ -91,52 +35,66 @@ jobs:
           print("dumped")
           PYEOF
           python3 /tmp/dump_syms.py
-          wc -l symbols_all.txt || true
-          echo "=== symbols with lua/luau ==="
-          grep -iE "lua|luau" symbols_all.txt | head -100 || echo "none"
-          echo ""
-          echo "=== symbols with pcall/load/state ==="
-          grep -iE "pcall|loadstring|loadbuffer|getglobal|setglobal|getfield|setfield|pushcfunction|newstate|lua_state" symbols_all.txt | head -100 || echo "none"
-          echo ""
-          echo "=== symbols with Luau namespace (C++ mangled) ==="
-          grep -E "_ZN4Luau|Luau" symbols_all.txt | head -50 || echo "none"
+          wc -l symbols_all.txt
 
-      - name: Luau string scan
+      - name: Grep Luau / lua / ScriptContext
         run: |
-          F="RobloxLib"
-          echo "=== Luau error strings ==="
-          for s in "attempt to index" "attempt to call" "stack overflow" \
-                   "bad argument" "table expected" "string expected" \
-                   "number expected" "attempt to perform arithmetic" \
-                   "attempt to concatenate" "attempt to compare" \
-                   "function expected" "userdata expected"; do
-            count=$(strings -a "$F" | grep -c "$s" || true)
-            echo "  \"$s\": $count"
-          done
+          S="symbols_all.txt"
+          echo "############ [1] lua_ C API ############"
+          grep -E "^_lua_|^_luaL_|^_luaD_|^_luaV_|^_luaH_|^_luaS_|^_luaT_|^_luaG_|^_luaE_|^_luaF_|^_luaC_|^_luaM_|^_luaO_|^_luaU_|^_luaX_|^_luaY_|^_luaZ_" "$S" | head -200 || echo none
 
-      - name: Lua symbols via strings
-        run: |
-          F="RobloxLib"
-          echo "=== lua_ symbols via strings ==="
-          strings -a "$F" | grep -E "^lua_|^luaL_|^luaD_|^luaV_" | sort -u | head -100 || echo "none"
           echo ""
-          echo "=== luau/getgenv keywords ==="
-          strings -a "$F" | grep -iE "luau|getgenv|lua_State|lua_pcall|luaL_load" | sort -u | head -60 || echo "none"
+          echo "############ [2] lua_pcall / lua_resume / lua_load / loadstring / loadbuffer ############"
+          grep -iE "lua_pcall|lua_resume|lua_load|lua_call|loadstring|loadbuffer|luaL_load" "$S" | head -100 || echo none
 
-      - name: Save strings dump
+          echo ""
+          echo "############ [3] Luau:: namespace (C++ mangled) ############"
+          grep -E "_ZN4Luau" "$S" | head -200 || echo none
+
+          echo ""
+          echo "############ [4] Luau compile / codegen / bytecode ############"
+          grep -iE "Luau.*(compile|codegen|bytecode|execute|parse|load)" "$S" | head -120 || echo none
+
+          echo ""
+          echo "############ [5] RBX::Lua namespace ############"
+          grep -E "_ZN3RBX3Lua" "$S" | head -200 || echo none
+
+          echo ""
+          echo "############ [6] ScriptContext ############"
+          grep -E "ScriptContext" "$S" | head -120 || echo none
+
+          echo ""
+          echo "############ [7] lua_State / lua_Debug trong symbol ############"
+          grep -E "lua_State|lua_Debug" "$S" | head -60 || echo none
+
+          echo ""
+          echo "############ [8] LuauExpr / LuaBridge / WeakThreadRef ############"
+          grep -iE "LuauExpression|LuaBridge|WeakThreadRef|ScriptContextFacets" "$S" | head -120 || echo none
+
+          echo ""
+          echo "############ [9] execute / resume / pcall (chung) ############"
+          grep -iE "^__ZN.*(execute|resume|pcall|invoke)" "$S" | grep -iE "lua|script|vm" | head -120 || echo none
+
+      - name: Grep strings quan trọng
         run: |
-          strings -a RobloxLib > robloxlib_strings.txt
-          wc -l robloxlib_strings.txt
-          grep -iE "lua|luau" robloxlib_strings.txt > lua_strings.txt || true
-          wc -l lua_strings.txt || true
-          head -100 lua_strings.txt
+          strings -a RobloxLib > all_strings.txt
+          echo "############ [A] lua error strings ############"
+          grep -iE "attempt to (index|call|compare|concatenate|perform)" all_strings.txt | head -40 || echo none
+          echo ""
+          echo "############ [B] Luau compiler strings ############"
+          grep -iE "luau|luac|bytecode|opcode|proto" all_strings.txt | sort -u | head -80 || echo none
+          echo ""
+          echo "############ [C] ScriptContext / Runtime strings ############"
+          grep -iE "ScriptContext|LocalScript|ModuleScript|ScriptRuntime" all_strings.txt | sort -u | head -60 || echo none
+          echo ""
+          echo "############ [D] getgenv / executor strings ############"
+          grep -iE "getgenv|getrenv|getrawmetatable|hookfunction|identifyexecutor|setreadonly|checkcaller|islclosure" all_strings.txt | sort -u | head -40 || echo none
 
-      - name: Upload artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: robloxlib-analysis
+          name: luau-recon
           path: |
-            robloxlib_strings.txt
-            lua_strings.txt
             symbols_all.txt
+            all_strings.txt
           retention-days: 7
