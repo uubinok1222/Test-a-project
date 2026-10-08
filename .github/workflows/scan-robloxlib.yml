@@ -1,4 +1,4 @@
-name: luau-recon
+name: luau-recon-full
 
 on:
   workflow_dispatch:
@@ -6,95 +6,299 @@ on:
 jobs:
   recon:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y binutils file python3-pip
-          pip3 install lief
+          sudo apt-get install -y binutils file python3-pip llvm
+          pip3 install lief capstone
+          # verify tools
+          llvm-nm --version | head -2
+          llvm-objdump --version | head -2
 
-      - name: Download RobloxLib
+      - name: Download IPA
         run: |
-          curl -L --fail --retry 3 -o RobloxLib "https://pixeldrain.com/api/file/w7YGoTyZ"
-          ls -lh RobloxLib
+          curl -L --fail --retry 3 -o Roblox.ipa "https://pixeldrain.com/api/file/juq3UWse"
+          ls -lh Roblox.ipa
+
+      - name: Unzip IPA
+        run: |
+          unzip -q Roblox.ipa -d extracted
+          APP="extracted/Payload/Roblox.app"
+          echo "=== app dir ==="
+          ls -la "$APP" | head -30
+          echo ""
+          echo "=== RobloxLib ==="
+          ls -lh "$APP/Frameworks/RobloxLib.framework/RobloxLib"
+          cp "$APP/Frameworks/RobloxLib.framework/RobloxLib" ./RobloxLib
+          echo ""
+          echo "=== main binary ==="
+          ls -lh "$APP/Roblox"
+          cp "$APP/Roblox" ./Roblox
+
+      - name: Verify binaries
+        run: |
           file RobloxLib
-          sha256sum RobloxLib
+          file Roblox
+          echo ""
+          echo "=== arch ==="
+          # lief thay lipo
+          python3 -c "
+          import lief
+          for p in ['RobloxLib', 'Roblox']:
+              fat = lief.MachO.parse(p)
+              print(f'{p}: {len(fat)} slice(s)')
+              for b in fat:
+                  print(f'  cpu: {b.header.cpu_type}')
+          "
 
-      - name: Dump symbols
+      - name: Dump symbols with llvm-nm
         run: |
-          cat > /tmp/dump_syms.py << 'PYEOF'
+          echo "=== llvm-nm RobloxLib (all) ==="
+          llvm-nm --defined-only RobloxLib 2>&1 | tee nm_robloxlib.txt | wc -l
+          echo ""
+          echo "=== llvm-nm Roblox (all) ==="
+          llvm-nm --defined-only Roblox 2>&1 | tee nm_roblox.txt | wc -l
+          echo ""
+          echo "=== grep lua/luau trong RobloxLib ==="
+          grep -iE "lua|luau" nm_robloxlib.txt | head -200 || echo none
+          echo ""
+          echo "=== grep lua/luau trong Roblox ==="
+          grep -iE "lua|luau" nm_roblox.txt | head -100 || echo none
+
+      - name: Grep symbols with Python (lief, full)
+        run: |
+          cat > /tmp/dump_all_syms.py << 'PYEOF'
+          import lief
+          for path in ["RobloxLib", "Roblox"]:
+              print(f"\n######## {path} ########")
+              try:
+                  fat = lief.MachO.parse(path)
+                  with open(f"symbols_{path}.txt", "w") as f:
+                      for b in fat:
+                          for sym in b.symbols:
+                              f.write(sym.name + "\n")
+              except Exception as e:
+                  print(f"error: {e}")
+                  continue
+              # in
+              count = 0
+              with open(f"symbols_{path}.txt") as f:
+                  for line in f:
+                      count += 1
+              print(f"total: {count}")
+          PYEOF
+          python3 /tmp/dump_all_syms.py
+          echo ""
+          echo "=== RobloxLib: lua/luau ==="
+          grep -iE "lua|luau" symbols_RobloxLib.txt | head -200 || echo none
+          echo ""
+          echo "=== RobloxLib: ScriptContext ==="
+          grep -i "ScriptContext" symbols_RobloxLib.txt | head -80 || echo none
+
+      - name: Section headers
+        run: |
+          echo "=== RobloxLib sections ==="
+          llvm-objdump --section-headers RobloxLib 2>&1 | head -60
+          echo ""
+          echo "=== load commands ==="
+          llvm-objdump --macho --all-headers RobloxLib 2>&1 | grep -E "LC_|segname|vmaddr|fileoff|filesize" | head -80
+
+      - name: Luau error string addresses
+        run: |
+          echo "=== RobloxLib ==="
+          strings -a -t x RobloxLib | grep -E "attempt to (index|call|compare|concatenate|perform|get length)" | head -30 | tee luau_strings_robloxlib.txt
+          echo ""
+          echo "=== Roblox ==="
+          strings -a -t x Roblox | grep -E "attempt to (index|call|compare|concatenate|perform)" | head -30 | tee luau_strings_roblox.txt
+
+      - name: Find xrefs to Luau strings
+        run: |
+          cat > /tmp/find_xref.py << 'PYEOF'
+          import re
+          import subprocess
+          import sys
+
+          # đọc địa chỉ string
+          strings = []
+          try:
+              with open("luau_strings_robloxlib.txt") as f:
+                  for line in f:
+                      parts = line.strip().split(" ", 1)
+                      if parts:
+                          try:
+                              addr = int(parts[0], 16)
+                              strings.append((addr, parts[1] if len(parts) > 1 else ""))
+                          except ValueError:
+                              pass
+          except FileNotFoundError:
+              print("no strings file")
+              sys.exit(0)
+
+          print(f"found {len(strings)} lua strings")
+          for a, s in strings:
+              print(f"  {a:#x}: {s}")
+
+          # Lấy text section base address
+          result = subprocess.run(
+              ["llvm-objdump", "--section-headers", "RobloxLib"],
+              capture_output=True, text=True
+          )
+          print("\n=== sections ===")
+          print(result.stdout[:2000])
+
+          # scan binary tìm reference tới string address
+          # trên arm64, reference là ADRP + ADD
+          # đơn giản hóa: tìm byte pattern
+          with open("RobloxLib", "rb") as f:
+              data = f.read()
+
+          print(f"\nbinary size: {len(data):#x}")
+          print("\n[*] cần parse Mach-O segment mapping để tìm xref chính xác")
+          print("[*] bước tiếp: dùng capstone disasm và pattern ADRP+ADD")
+
+          # dump segments
+          result = subprocess.run(
+              ["llvm-objdump", "--macho", "--all-headers", "RobloxLib"],
+              capture_output=True, text=True
+          )
+          for line in result.stdout.split("\n"):
+              if "segname" in line or "vmaddr" in line or "fileoff" in line or "sectname" in line:
+                  print(line)
+          PYEOF
+          python3 /tmp/find_xref.py
+
+      - name: Capstone disasm — tìm hàm chứa Luau string ref
+        run: |
+          cat > /tmp/disasm_xref.py << 'PYEOF'
+          import lief
+          from capstone import *
+          import sys
+
+          path = "RobloxLib"
+          binary = lief.MachO.parse(path)
+          if binary is None:
+              print("cannot parse")
+              sys.exit(1)
+
+          b = binary[0]
+
+          # lấy text section
+          text_section = None
+          for sec in b.sections:
+              if sec.name == "__text":
+                  text_section = sec
+                  break
+
+          if text_section is None:
+              print("no __text")
+              sys.exit(1)
+
+          print(f"__text: addr={text_section.virtual_address:#x} size={text_section.size:#x} offset={text_section.offset:#x}")
+
+          # tìm string "attempt to index %s with '%s'"
+          target_string = "attempt to index %s with '%s'"
+          str_addr = None
+          for sec in b.sections:
+              if sec.name in ("__cstring", "__const", "__data"):
+                  try:
+                      content = bytes(sec.content)
+                      idx = content.find(target_string.encode())
+                      if idx >= 0:
+                          str_addr = sec.virtual_address + idx
+                          print(f"found string in {sec.name} @ {str_addr:#x}")
+                          break
+                  except Exception:
+                      pass
+
+          if str_addr is None:
+              print("string not found in sections")
+              sys.exit(1)
+
+          # scan text section tìm ADRP+ADD reference
+          md = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
+          md.detail = True
+
+          text_bytes = bytes(text_section.content)
+          text_va = text_section.virtual_address
+
+          # Parse instructions, track ADRP + ADD pairs
+          adrp_val = {}  # reg -> value
+          candidates = []
+
+          for insn in md.disasm(text_bytes, text_va):
+              # ADRP
+              if insn.mnemonic == "adrp":
+                  try:
+                      reg = insn.operands[0].reg
+                      imm = insn.operands[1].imm
+                      adrp_val[reg] = imm
+                  except Exception:
+                      pass
+              # ADD với ADRP trước
+              elif insn.mnemonic == "add" and len(insn.operands) >= 3:
+                  try:
+                      dst = insn.operands[0].reg
+                      src = insn.operands[1].reg
+                      imm_op = insn.operands[2]
+                      if imm_op.type == ARM64_OP_IMM and src in adrp_val:
+                          target = adrp_val[src] + imm_op.imm
+                          if target == str_addr:
+                              candidates.append(insn.address)
+                              print(f"[XREF] {insn.address:#x}: {insn.mnemonic} {insn.op_str}")
+                  except Exception:
+                      pass
+
+          print(f"\ntotal xrefs to string: {len(candidates)}")
+
+          # với mỗi xref, tìm function chứa nó
+          if candidates:
+              funcs = b.functions
+              print(f"\ntotal functions parsed: {len(funcs)}")
+              for xref in candidates[:10]:
+                  for f in funcs:
+                      if f.address <= xref < f.address + f.size:
+                          print(f"  xref {xref:#x} inside function {f.name or 'unnamed'} @ {f.address:#x} size={f.size}")
+                          break
+
+          # Nếu không tìm thấy function, in ra cửa sổ ±32 instr quanh xref
+          if candidates:
+              print(f"\n=== disasm context around first xref ===")
+              target = candidates[0]
+              start = target - 0x200
+              end = target + 0x200
+              for insn in md.disasm(text_bytes[max(0,start-text_va):end-text_va], max(text_va, start)):
+                  mark = " <<<<<" if insn.address == target else ""
+                  print(f"  {insn.address:#x}: {insn.mnemonic:8} {insn.op_str}{mark}")
+          PYEOF
+          pip install capstone 2>&1 | tail -1
+          python3 /tmp/disasm_xref.py 2>&1 | head -200
+
+      - name: List functions (lief)
+        run: |
+          cat > /tmp/list_funcs.py << 'PYEOF'
           import lief
           fat = lief.MachO.parse("RobloxLib")
-          with open("symbols_all.txt", "w") as f:
-              for b in fat:
-                  for sym in b.symbols:
-                      f.write(sym.name + "\n")
-          print("dumped")
+          b = fat[0]
+
+          print(f"functions: {len(b.functions)}")
+          for f in b.functions[:50]:
+              print(f"  {f.address:#x} {f.name} size={f.size}")
           PYEOF
-          python3 /tmp/dump_syms.py
-          wc -l symbols_all.txt
-
-      - name: Grep Luau / lua / ScriptContext
-        run: |
-          S="symbols_all.txt"
-          echo "############ [1] lua_ C API ############"
-          grep -E "^_lua_|^_luaL_|^_luaD_|^_luaV_|^_luaH_|^_luaS_|^_luaT_|^_luaG_|^_luaE_|^_luaF_|^_luaC_|^_luaM_|^_luaO_|^_luaU_|^_luaX_|^_luaY_|^_luaZ_" "$S" | head -200 || echo none
-
-          echo ""
-          echo "############ [2] lua_pcall / lua_resume / lua_load / loadstring / loadbuffer ############"
-          grep -iE "lua_pcall|lua_resume|lua_load|lua_call|loadstring|loadbuffer|luaL_load" "$S" | head -100 || echo none
-
-          echo ""
-          echo "############ [3] Luau:: namespace (C++ mangled) ############"
-          grep -E "_ZN4Luau" "$S" | head -200 || echo none
-
-          echo ""
-          echo "############ [4] Luau compile / codegen / bytecode ############"
-          grep -iE "Luau.*(compile|codegen|bytecode|execute|parse|load)" "$S" | head -120 || echo none
-
-          echo ""
-          echo "############ [5] RBX::Lua namespace ############"
-          grep -E "_ZN3RBX3Lua" "$S" | head -200 || echo none
-
-          echo ""
-          echo "############ [6] ScriptContext ############"
-          grep -E "ScriptContext" "$S" | head -120 || echo none
-
-          echo ""
-          echo "############ [7] lua_State / lua_Debug trong symbol ############"
-          grep -E "lua_State|lua_Debug" "$S" | head -60 || echo none
-
-          echo ""
-          echo "############ [8] LuauExpr / LuaBridge / WeakThreadRef ############"
-          grep -iE "LuauExpression|LuaBridge|WeakThreadRef|ScriptContextFacets" "$S" | head -120 || echo none
-
-          echo ""
-          echo "############ [9] execute / resume / pcall (chung) ############"
-          grep -iE "^__ZN.*(execute|resume|pcall|invoke)" "$S" | grep -iE "lua|script|vm" | head -120 || echo none
-
-      - name: Grep strings quan trọng
-        run: |
-          strings -a RobloxLib > all_strings.txt
-          echo "############ [A] lua error strings ############"
-          grep -iE "attempt to (index|call|compare|concatenate|perform)" all_strings.txt | head -40 || echo none
-          echo ""
-          echo "############ [B] Luau compiler strings ############"
-          grep -iE "luau|luac|bytecode|opcode|proto" all_strings.txt | sort -u | head -80 || echo none
-          echo ""
-          echo "############ [C] ScriptContext / Runtime strings ############"
-          grep -iE "ScriptContext|LocalScript|ModuleScript|ScriptRuntime" all_strings.txt | sort -u | head -60 || echo none
-          echo ""
-          echo "############ [D] getgenv / executor strings ############"
-          grep -iE "getgenv|getrenv|getrawmetatable|hookfunction|identifyexecutor|setreadonly|checkcaller|islclosure" all_strings.txt | sort -u | head -40 || echo none
+          python3 /tmp/list_funcs.py 2>&1 | head -80
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: luau-recon
+          name: luau-recon-full
           path: |
-            symbols_all.txt
-            all_strings.txt
+            nm_robloxlib.txt
+            nm_roblox.txt
+            symbols_RobloxLib.txt
+            symbols_Roblox.txt
+            luau_strings_robloxlib.txt
+            luau_strings_roblox.txt
           retention-days: 7
